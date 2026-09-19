@@ -2,6 +2,10 @@
 
 An intelligent interview platform that leverages machine learning to analyze candidate responses in real-time, helping hiring managers make data-driven decisions during the recruitment process.
 
+🎥 Demo Video: 
+
+https://github.com/user-attachments/assets/3a71b475-f177-4809-85c8-fb5f6af4f390
+
 ## 📋 About The Project
 
 SpeakSure is an AI-powered behavioral interview system designed to assist hiring managers in shortlisting candidates more efficiently. The system uses a custom-trained Multi-Layer Perceptron (MLP) model to analyze human speech patterns, confidence levels, and various linguistic parameters in real-time.
