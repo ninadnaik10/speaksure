@@ -227,8 +227,3 @@ The API base URL comes from `VITE_API_BASE` (see `client/.env.development` and
 - `GET  /api/health` - Liveness and database probe
 - `POST /api/predict` - Analyze a recorded answer and persist the result
 - `GET  /api/get_results` - Retrieve all interview results
-
-## 🚢 Deployment
-
-See [DEPLOYMENT.md](DEPLOYMENT.md) for hosting on an Oracle Cloud Always Free ARM
-instance with gunicorn, systemd and nginx.
