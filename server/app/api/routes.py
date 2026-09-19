@@ -1,242 +1,126 @@
-import io
-import json
-from flask import request, jsonify, current_app, send_file, Blueprint
-from . import api_blueprint
-from .services import MLService, TranscriptionService, GrammarService, DatabaseService
-from moviepy.editor import VideoFileClip
-import tempfile
-import os
 import asyncio
-from concurrent.futures import ThreadPoolExecutor
+import logging
+import tempfile
+from pathlib import Path
+from typing import Annotated
 
-@api_blueprint.route('/predict', methods=['POST'])
-def predict():
-    if 'audio' not in request.files:
-        return jsonify({"error": "No file provided"}), 400
+from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile, status
 
-    uploaded_file = request.files['audio']
-    filename = uploaded_file.filename.lower()
+from app.core.audio import AudioError, UploadTooLarge, convert_to_wav, save_upload
+from app.api.services import DatabaseService, FeedbackService, MLService, TranscriptionService
 
-    question = request.form.get('question', "N/A")
+logger = logging.getLogger(__name__)
 
-    if not (filename.endswith('.wav') or filename.endswith('.webm')):
-        return jsonify({"error": "Unsupported file type. Only .wav or .webm allowed"}), 400
-
-    return asyncio.run(predict_async(uploaded_file, filename, question))
+router = APIRouter()
 
 
-async def predict_async(uploaded_file, filename, question):
-    temp_audio_path = None
-    executor = ThreadPoolExecutor()
-    
+def _ml(request: Request) -> MLService:
+    return request.app.state.ml_service
+
+
+def _transcription(request: Request) -> TranscriptionService:
+    return request.app.state.transcription_service
+
+
+def _feedback(request: Request) -> FeedbackService:
+    return request.app.state.feedback_service
+
+
+def _db(request: Request) -> DatabaseService:
+    return request.app.state.db_service
+
+
+@router.get("/health")
+async def health(request: Request) -> dict:
+    """Liveness plus a cheap database round-trip, for nginx and systemd probes."""
+    database_ok = True
     try:
-        if filename.endswith('.webm'):
-            audio_file_path = await asyncio.get_event_loop().run_in_executor(
-                executor, process_webm, uploaded_file
+        await asyncio.to_thread(_db(request).ping)
+    except Exception:
+        logger.warning("Health check could not reach MongoDB", exc_info=True)
+        database_ok = False
+
+    return {
+        "status": "ok" if database_ok else "degraded",
+        "models_loaded": hasattr(request.app.state, "ml_service"),
+        "database": "up" if database_ok else "down",
+    }
+
+
+@router.post("/predict")
+async def predict(
+    request: Request,
+    audio: Annotated[UploadFile, File()],
+    interview_id: Annotated[str, Form()],
+    name: Annotated[str, Form()],
+    question: Annotated[str, Form()] = "N/A",
+) -> dict:
+    settings = request.app.state.settings
+
+    with tempfile.TemporaryDirectory(prefix="speaksure-") as workdir:
+        raw_path = Path(workdir) / "upload"
+        wav_path = Path(workdir) / "audio.wav"
+
+        try:
+            await save_upload(audio, raw_path, settings.max_upload_bytes)
+            await convert_to_wav(raw_path, wav_path, settings.sample_rate)
+        except UploadTooLarge as exc:
+            raise HTTPException(
+                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail=str(exc)
+            ) from exc
+        except AudioError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
+            ) from exc
+
+        try:
+            # Inference is CPU-bound and transcription is a network round-trip,
+            # so overlap them; both run off the event loop.
+            (prediction_sequence, avg_prediction), transcript_result = await asyncio.gather(
+                asyncio.to_thread(_ml(request).predict, wav_path),
+                asyncio.to_thread(_transcription(request).transcribe, wav_path),
             )
-            temp_audio_path = audio_file_path
-        else:
-            with tempfile.NamedTemporaryFile(delete=False, suffix='.wav') as temp_audio:
-                uploaded_file.save(temp_audio.name)
-                audio_file_path = temp_audio.name
+            transcript, num_words, duration, speech_rate_wpm = transcript_result
 
-        with open(audio_file_path, 'rb') as audio_file:
-            audio_content = audio_file.read()
-        
-        tasks = [
-            asyncio.get_event_loop().run_in_executor(
-                executor, run_ml_prediction, audio_content, current_app.ml_service
-            ),
-            asyncio.get_event_loop().run_in_executor(
-                executor, run_transcription, audio_content, current_app.transcription_service
-            ),
-            
-        ]
-        
-        results = await asyncio.gather(*tasks)
-        prediction_sequence, avg_prediction = results[0]
-        transcript, num_of_words, duration, speech_rate_wpm = results[1]
-        print("Transcript:", transcript)
-        feedback = await asyncio.get_event_loop().run_in_executor(
-            executor, run_llm_prediction, question, transcript, avg_prediction, speech_rate_wpm, current_app.ml_service
-        )
+            feedback = await asyncio.to_thread(
+                _feedback(request).generate,
+                question,
+                transcript,
+                avg_prediction,
+                speech_rate_wpm,
+            )
+        except Exception as exc:
+            logger.exception("Prediction failed for interview %s", interview_id)
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)
+            ) from exc
 
-        
-        metadata = {
-            **request.form,
-            "prediction": prediction_sequence,
-            "avg_prediction": avg_prediction,
-            "transcript": transcript,
-            "numofwords": num_of_words,
-            "speech_rate_wpm": speech_rate_wpm,
-            "feedback": feedback
-        }
-        
-        await asyncio.get_event_loop().run_in_executor(
-            executor, current_app.db_service.upload_results, metadata
-        )
-        
-        return jsonify({"message": "OK"}), 200
-
-    except Exception as e:
-        current_app.logger.error(f"Prediction error: {e}")
-        return jsonify({"error": str(e)}), 500
-
-    finally:
-        if temp_audio_path and os.path.exists(temp_audio_path):
-            os.remove(temp_audio_path)
-        executor.shutdown(wait=False)
-
-
-def process_webm(uploaded_file):
-    with tempfile.NamedTemporaryFile(delete=False, suffix='.webm') as temp_video:
-        uploaded_file.save(temp_video.name)
-        temp_video.flush()
-
-        with VideoFileClip(temp_video.name) as video:
-            temp_audio_path = tempfile.NamedTemporaryFile(delete=False, suffix='.wav').name
-            video.audio.write_audiofile(temp_audio_path, codec='pcm_s16le')
-        
-        return temp_audio_path
-
-
-def run_ml_prediction(audio_content, ml_service):
-    import io
-    audio_file = io.BytesIO(audio_content)
-    return ml_service.predict_from_audio_file(audio_file)
-
-
-def run_llm_prediction(question, transcript, avg_prediction, speech_rate_wpm, ml_service):
-    return ml_service.query_llm(question, transcript, avg_prediction, speech_rate_wpm)
-
-
-def run_transcription(audio_content, transcription_service):
-    import io
-    audio_file = io.BytesIO(audio_content)
-    return transcription_service.transcribe_and_analyze(audio_file)
-
-# @api_blueprint.route('/predict', methods=['POST'])
-# def predict():
-#     if 'audio' not in request.files:
-#         return jsonify({"error": "No audio file provided"}), 400
-
-#     audio_file = request.files['audio']
-    
-#     try:
-#         # Get predictions
-#         prediction_sequence, avg_prediction = current_app.ml_service.predict_from_audio_file(audio_file)
-        
-#         # Get transcription and related metrics
-#         audio_file.seek(0) # Reset file pointer after reading
-#         transcript, num_of_words, duration, speech_rate_wpm = current_app.transcription_service.transcribe_and_analyze(audio_file)
-        
-#         # Get grammar issues
-#         issues = current_app.grammar_service.check_grammar(transcript)
-
-#         return jsonify({
-#             "prediction": prediction_sequence,
-#             "avg_prediction": avg_prediction,
-#             "transcript": transcript,
-#             "numofwords": num_of_words,
-#             "speech_rate_wpm": speech_rate_wpm,
-#             "issues": issues
-#         }), 200
-
-#     except Exception as e:
-#         current_app.logger.error(f"Prediction error: {e}")
-#         return jsonify({"error": str(e)}), 500
-
-@api_blueprint.route('/upload', methods=['POST'])
-def upload():
-    if 'audio' not in request.files:
-        return jsonify({"error": "No audio file uploaded"}), 400
+    response = {
+        "question": question,
+        "prediction": prediction_sequence,
+        "avg_prediction": avg_prediction,
+        "transcript": transcript,
+        "numofwords": num_words,
+        "duration": round(duration, 2),
+        "speech_rate_wpm": speech_rate_wpm,
+        "feedback": feedback,
+    }
 
     try:
-        form_data = request.form.to_dict()
-        audio_file = request.files['audio']
-        
-        score_str = form_data.get('score', '0')
-        score = [int(s) for s in score_str.split(',') if s.strip()]
-        avg_prediction = sum(score) / len(score) if score else 0
-        
-        issues_str = form_data.get('issues', "[]")
-        issues = json.loads(issues_str)
-        
-        metadata = {
-            "score": score,
-            "avg_prediction": avg_prediction,
-            "transcript": form_data.get('transcript', "N/A"),
-            "numofwords": form_data.get('numofwords', "N/A"),
-            "speed": form_data.get('speed', "N/A"),
-            "noofgrammar": form_data.get('noofgrammar', "N/A"),
-            "percentfiller": form_data.get('percentfiller', "N/A"),
-            "issues": issues
-        }
+        await asyncio.to_thread(
+            _db(request).upload_results, interview_id, name, response
+        )
+    except Exception as exc:
+        logger.exception("Could not persist results for interview %s", interview_id)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"Analysis succeeded but could not be saved: {exc}",
+        ) from exc
 
-        filename = form_data.get('filename', "default.wav")
-        file_id = current_app.db_service.upload_file(audio_file, filename, metadata)
-        
-        return jsonify({
-            "message": "Data Uploaded Successfully",
-            "file_id": str(file_id),
-            "avg_prediction": avg_prediction
-        }), 201
+    return {"message": "OK", **response}
 
-    except (ValueError, json.JSONDecodeError) as e:
-        return jsonify({"error": f"Invalid form data: {e}"}), 400
-    except Exception as e:
-        current_app.logger.error(f"Upload error: {e}")
-        return jsonify({"error": str(e)}), 500
 
-@api_blueprint.route('/get_filenames', methods=['GET'])
-def get_filenames():
-    files = current_app.db_service.get_all_files()
-    if not files:
-        return jsonify({"error": "No files found"}), 404
-    return jsonify({"files": files}), 200
-
-@api_blueprint.route('/get_audio', methods=['GET'])
-def get_audio():
-    filename = request.args.get("filename")
-    if not filename:
-        return jsonify({"error": "Filename is required"}), 400
-    
-    file_data, file_doc = current_app.db_service.get_file_by_name(filename)
-    if not file_data:
-        return jsonify({"error": "File not found"}), 404
-
-    return send_file(
-        io.BytesIO(file_data.read()),
-        download_name=filename,
-        mimetype='audio/wav',
-        as_attachment=True
-    )
-
-@api_blueprint.route('/get_metadata', methods=['GET'])
-def get_metadata():
-    filename = request.args.get("filename")
-    if not filename:
-        return jsonify({"error": "Filename is required"}), 400
-
-    metadata = current_app.db_service.get_metadata_by_name(filename)
-    if metadata is None:
-        return jsonify({"error": "File not found"}), 404
-
-    return jsonify({"metadata": metadata})
-
-@api_blueprint.route('/delete_audio', methods=['DELETE'])
-def delete_audio():
-    filename = request.args.get("filename")
-    if not filename:
-        return jsonify({"error": "Filename is required"}), 400
-
-    success = current_app.db_service.delete_file_by_name(filename)
-    if not success:
-        return jsonify({"error": "File not found or failed to delete"}), 404
-        
-    return jsonify({"message": f"File '{filename}' deleted successfully"}), 200
-
-@api_blueprint.route('/get_results', methods=['GET'])
-def get_results():
-    results = current_app.db_service.get_results()
-    return jsonify({"results": results}), 200
+@router.get("/get_results")
+async def get_results(request: Request) -> dict:
+    results = await asyncio.to_thread(_db(request).get_results)
+    return {"results": results}

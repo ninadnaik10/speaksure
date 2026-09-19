@@ -1,33 +1,78 @@
-import os
+from functools import lru_cache
+from pathlib import Path
+from typing import Literal
 
-class Config:
-    SECRET_KEY = os.environ.get('SECRET_KEY') or 'a-very-secret-key'
-    
-    MODEL_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'models')
-    MODEL_PATH = os.path.join(MODEL_DIR, "trained_model.h5")
-    SCALER_PATH = os.path.join(MODEL_DIR, "scaler.pkl")
-    
-    SAMPLE_RATE = 16000
-    TRANSFORMER_MODEL_NAME = "facebook/wav2vec2-base-960h"
-    
-    MONGO_URI = os.environ.get("MONGO_URI")
-    DATABASE_NAME = "Speaksure2"
-    GRIDFS_BUCKET_NAME = "result_bucket"
-    
-    ASSEMBLYAI_API_KEY = os.environ.get("ASSEMBLYAI_API_KEY")
+from pydantic import model_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
-    @staticmethod
-    def init_app(app):
-        pass
+APP_DIR = Path(__file__).resolve().parent.parent
+MODELS_DIR = APP_DIR / "models"
 
-class DevelopmentConfig(Config):
-    DEBUG = True
+DEV_SECRET = "dev-insecure-change-me"
 
-class ProductionConfig(Config):
-    DEBUG = False
 
-config = {
-    'development': DevelopmentConfig,
-    'production': ProductionConfig,
-    'default': DevelopmentConfig
-}
+class Settings(BaseSettings):
+    """Application settings, read from the environment (and .env in development)."""
+
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        case_sensitive=False,
+        extra="ignore",
+        protected_namespaces=(),
+    )
+
+    app_env: Literal["development", "production"] = "production"
+    secret_key: str = DEV_SECRET
+
+    mongo_uri: str
+    database_name: str = "Speaksure2"
+
+    assemblyai_api_key: str
+    gemini_api_key: str
+    gemini_model: str = "gemini-2.5-flash"
+
+    transformer_model_name: str = "facebook/wav2vec2-base-960h"
+    sample_rate: int = 16000
+
+    # Uploads larger than this are rejected before anything is written to disk.
+    max_upload_bytes: int = 100 * 1024 * 1024
+
+    # Comma-separated. Leave empty when the API is served same-origin behind nginx.
+    cors_origins: str = ""
+
+    # Tuned for a 4 OCPU box shared by 2 workers: keep BLAS/torch from
+    # oversubscribing every core and thrashing.
+    torch_num_threads: int = 2
+    thread_pool_size: int = 8
+
+    @property
+    def keras_model_path(self) -> Path:
+        return MODELS_DIR / "trained_model.h5"
+
+    @property
+    def scaler_path(self) -> Path:
+        return MODELS_DIR / "scaler.pkl"
+
+    @property
+    def cors_origin_list(self) -> list[str]:
+        return [origin.strip() for origin in self.cors_origins.split(",") if origin.strip()]
+
+    @property
+    def is_production(self) -> bool:
+        return self.app_env == "production"
+
+    @model_validator(mode="after")
+    def _guard_production(self) -> "Settings":
+        if not self.is_production:
+            return self
+        if self.secret_key == DEV_SECRET:
+            raise ValueError("SECRET_KEY must be set to a real value when APP_ENV=production")
+        if "*" in self.cors_origin_list:
+            raise ValueError("CORS_ORIGINS must not be '*' when APP_ENV=production")
+        return self
+
+
+@lru_cache
+def get_settings() -> Settings:
+    return Settings()

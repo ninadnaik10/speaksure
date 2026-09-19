@@ -1,4 +1,5 @@
 import React, { useState, useRef, useEffect } from "react";
+import { apiUrl } from "../lib/api";
 import { Camera, Mic, Square, Send, CheckCircle } from "lucide-react";
 import { Button } from "../components/ui/button";
 import {
@@ -195,7 +196,7 @@ const BehavioralInterview: React.FC = () => {
     formData.append("question", questions[currentQuestion]);
 
     try {
-      const response = await fetch("http://127.0.0.1:5000/api/predict", {
+      const response = await fetch(apiUrl("predict"), {
         method: "POST",
         body: formData,
       });

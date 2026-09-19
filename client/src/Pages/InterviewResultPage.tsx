@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from "react";
+import { apiUrl } from "../lib/api";
 import {
   Users,
   ChevronRight,
@@ -81,7 +82,7 @@ const InterviewerDashboard: React.FC = () => {
 
   const fetchInterviews = async (): Promise<void> => {
     try {
-      const response = await fetch("http://127.0.0.1:5000/api/get_results");
+      const response = await fetch(apiUrl("get_results"));
       if (!response.ok) throw new Error("Failed to fetch interviews");
       const data: ApiResponse = await response.json();
       setInterviews(data.results || []);

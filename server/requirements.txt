@@ -1,12 +1,28 @@
-Flask
-Flask-Cors
-pymongo
-numpy
-librosa
-torch
-transformers
-tensorflow
-assemblyai
-language-tool-python
-scikit-learn
-python-dotenv
+# Web layer
+fastapi==0.141.1
+uvicorn[standard]==0.53.0
+uvicorn-worker==0.4.0
+gunicorn==26.2.0
+python-multipart==0.0.32
+pydantic==2.13.5
+pydantic-settings==2.15.0
+
+# Data
+pymongo==4.15.3
+
+# Audio + ML
+numpy==2.2.6
+scipy==1.15.3
+scikit-learn==1.6.1  # must match the version that pickled scaler.pkl
+joblib==1.5.2
+librosa==0.11.0
+soundfile==0.13.1
+numba==0.62.1
+torch==2.8.0
+transformers==4.57.0
+tensorflow==2.20.0
+keras==3.11.3
+
+# External services
+assemblyai==0.44.3
+google-genai==1.43.0

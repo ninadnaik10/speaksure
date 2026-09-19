@@ -11,7 +11,6 @@ SpeakSure is an AI-powered behavioral interview system designed to assist hiring
 - **🎤 Real-time Audio Recording & Analysis**: Capture and analyze candidate responses during interviews
 - **🧠 AI-Powered Confidence Detection**: Custom MLP model trained on behavioral interview data to predict speaker confidence (1-5 scale)
 - **📝 Automatic Transcription**: Leverages AssemblyAI for accurate speech-to-text conversion
-- **✍️ Grammar Analysis**: Identifies and flags grammatical errors in responses
 - **📊 Speech Metrics**: Calculates words per minute, duration, and other speech characteristics
 - **🤖 LLM-Powered Insights**: Uses Google Gemini to generate actionable feedback for hiring managers
 - **💾 Persistent Storage**: MongoDB for storing interview results
@@ -36,20 +35,23 @@ speaksure-interview/
 │   ├── package.json                 # Frontend dependencies
 │   └── vite.config.ts               # Vite configuration
 │
-├── server/                          # Flask Backend Application
+├── server/                          # FastAPI Backend Application
 │   ├── app/
 │   │   ├── api/                     # API layer
 │   │   │   ├── routes.py            # API endpoints
-│   │   │   └── services.py          # Business logic services
-│   │   ├── core/                    # Core configuration
-│   │   │   └── config.py            # App configuration
-│   │   └── models/                  # ML models
-│   │       ├── trained_model.h5     # TensorFlow MLP model
-│   │       └── scaler.pkl           # Feature scaler
+│   │   │   └── services.py          # ML, transcription, LLM, database services
+│   │   ├── core/
+│   │   │   ├── config.py            # Settings (pydantic-settings)
+│   │   │   └── audio.py             # Upload streaming + ffmpeg normalisation
+│   │   ├── models/                  # ML artifacts
+│   │   │   ├── trained_model.h5     # TensorFlow MLP model
+│   │   │   └── scaler.pkl           # Feature scaler
+│   │   └── main.py                  # ASGI application factory
 │   ├── requirements.txt             # Python dependencies
-│   └── run.py                       # Application entry point
+│   └── run.py                       # Development entry point
 │
-└── venv/                            # Python virtual environment
+├── deploy/                          # systemd unit, nginx site, deploy script
+└── DEPLOYMENT.md                    # Oracle Cloud ARM hosting guide
 ```
 
 ## 🛠️ Technology Stack
@@ -67,13 +69,13 @@ speaksure-interview/
 
 ### Backend
 
-- **Flask** - Python web framework
+- **FastAPI** - Python web framework (ASGI)
+- **Uvicorn / Gunicorn** - ASGI server and process manager
 - **TensorFlow** - Deep learning framework for MLP model
 - **PyTorch** - Deep learning framework for Wav2Vec2
 - **Transformers (Hugging Face)** - Wav2Vec2 audio feature extraction
 - **librosa** - Audio processing and analysis
 - **AssemblyAI** - Speech-to-text transcription
-- **language-tool-python** - Grammar checking
 - **MongoDB** - Database
 - **Google Gemini** - LLM for generating insights
 - **scikit-learn** - Feature scaling
@@ -90,7 +92,8 @@ speaksure-interview/
 ### Prerequisites
 
 - **Node.js** (v18 or higher)
-- **Python** (v3.10 or higher)
+- **Python** 3.10+ (3.12 on the deployment target)
+- **ffmpeg** and **libsndfile** (`brew install ffmpeg libsndfile` / `apt install ffmpeg libsndfile1`)
 - **MongoDB** (local or cloud instance)
 - **API Keys**:
   - AssemblyAI API Key
@@ -128,12 +131,15 @@ touch .env
 Add the following environment variables to `.env`:
 
 ```env
-FLASK_ENV=development
+APP_ENV=development
 SECRET_KEY=your-secret-key
 MONGO_URI=your-mongodb-connection-string
 ASSEMBLYAI_API_KEY=your-assemblyai-api-key
-GOOGLE_API_KEY=your-google-gemini-api-key
+GEMINI_API_KEY=your-google-gemini-api-key
+CORS_ORIGINS=http://localhost:6173,http://127.0.0.1:6173
 ```
+
+See `server/.env.example` for the full list of supported variables.
 
 #### 3. Frontend Setup
 
@@ -158,7 +164,7 @@ source venv/bin/activate  # Activate venv if not already active
 python run.py
 ```
 
-The Flask server will start on `http://localhost:5000`
+The API starts on `http://localhost:5000`, with interactive docs at `http://localhost:5000/docs` (development only).
 
 #### Start the Frontend Development Server
 
@@ -170,21 +176,27 @@ npm run dev
 yarn dev
 ```
 
-The React app will start on `http://localhost:5173` (or another port if 5173 is busy)
+The React app will start on `http://localhost:6173` (set in `client/vite.config.ts`).
 
 ## 🔧 Configuration
 
 ### Backend Configuration (`server/app/core/config.py`)
 
+All settings are environment variables, validated at startup by pydantic-settings.
+Production refuses to boot with a default `SECRET_KEY` or a wildcard CORS origin.
+
+- `APP_ENV`: `development` or `production`
 - `SAMPLE_RATE`: Audio sampling rate (default: 16000 Hz)
 - `TRANSFORMER_MODEL_NAME`: Wav2Vec2 model identifier
-- `MODEL_PATH`: Path to trained MLP model
-- `SCALER_PATH`: Path to feature scaler
 - `DATABASE_NAME`: MongoDB database name
+- `MAX_UPLOAD_BYTES`: Upload ceiling (default: 100 MB)
+- `CORS_ORIGINS`: Comma-separated; leave empty when served same-origin
+- `TORCH_NUM_THREADS` / `THREAD_POOL_SIZE`: CPU tuning for small instances
 
 ### Frontend Configuration
 
-Update the API base URL in your axios configuration if needed (typically in `client/src/` files).
+The API base URL comes from `VITE_API_BASE` (see `client/.env.development` and
+`client/.env.production`) and is used via the `apiUrl()` helper in `src/lib/api.ts`.
 
 ## 📊 How It Works
 
@@ -196,7 +208,6 @@ Update the API base URL in your axios configuration if needed (typically in `cli
    - MLP model predicts confidence score for each chunk (1-5 scale)
 4. **Transcription**: AssemblyAI converts speech to text
 5. **Analysis**:
-   - Grammar checker identifies linguistic errors
    - Speech rate calculated (words per minute)
    - Average confidence computed across all chunks
 6. **AI Feedback**: Google Gemini generates critical feedback based on:
@@ -209,7 +220,11 @@ Update the API base URL in your axios configuration if needed (typically in `cli
 
 ## 📁 API Endpoints
 
-- `POST /api/upload` - Upload and analyze audio recording
-- `GET /api/results` - Retrieve all interview results
-- `GET /api/results/<interview_id>` - Get specific interview results
-- Additional endpoints in `server/app/api/routes.py`
+- `GET  /api/health` - Liveness and database probe
+- `POST /api/predict` - Analyze a recorded answer and persist the result
+- `GET  /api/get_results` - Retrieve all interview results
+
+## 🚢 Deployment
+
+See [DEPLOYMENT.md](DEPLOYMENT.md) for hosting on an Oracle Cloud Always Free ARM
+instance with gunicorn, systemd and nginx.

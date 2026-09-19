@@ -1,0 +1,47 @@
+[Unit]
+Description=SpeakSure FastAPI backend
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+User=speaksure
+Group=speaksure
+WorkingDirectory=/opt/speaksure/app/server
+EnvironmentFile=/etc/speaksure.env
+
+# 1 OCPU: one BLAS thread per worker avoids pure contention overhead.
+# Raise to 2 if you resize the instance to 4 OCPU.
+Environment=OMP_NUM_THREADS=1
+Environment=MKL_NUM_THREADS=1
+Environment=TF_CPP_MIN_LOG_LEVEL=2
+Environment=PYTHONUNBUFFERED=1
+
+ExecStart=/opt/speaksure/venv/bin/gunicorn app.main:app \
+    --worker-class uvicorn_worker.UvicornWorker \
+    --workers 2 \
+    --bind 127.0.0.1:5000 \
+    --timeout 300 \
+    --graceful-timeout 60 \
+    --access-logfile - \
+    --error-logfile -
+
+Restart=always
+RestartSec=5
+KillSignal=SIGTERM
+
+# Model loading takes ~30-60s on Ampere A1; don't let systemd give up early.
+TimeoutStartSec=300
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+ReadWritePaths=/opt/speaksure/hf-cache
+
+[Install]
+WantedBy=multi-user.target
