@@ -1,3 +1,7 @@
+# Production server. Acoustic inference is delegated to the Hugging Face Space
+# in spaces/ -- set INFERENCE_SPACE_URL. For in-process inference instead,
+# also install requirements-local.txt.
+
 # Web layer
 fastapi==0.141.1
 uvicorn[standard]==0.53.0
@@ -10,19 +14,11 @@ pydantic-settings==2.15.0
 # Data
 pymongo==4.15.3
 
-# Audio + ML
+# Audio + classifier (NumPy only; see app/core/mlp.py)
 numpy==2.2.6
-scipy==1.15.3
-scikit-learn==1.6.1  # must match the version that pickled scaler.pkl
-joblib==1.5.2
-librosa==0.11.0
 soundfile==0.13.1
-numba==0.62.1
-torch==2.8.0
-transformers==4.57.0
-tensorflow==2.20.0
-keras==3.11.3
 
 # External services
 assemblyai==0.44.3
 google-genai==1.43.0
+gradio-client==2.7.1

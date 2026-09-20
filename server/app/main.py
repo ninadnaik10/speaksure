@@ -8,7 +8,12 @@ from fastapi.responses import JSONResponse
 from pymongo.errors import PyMongoError
 
 from app.api import router
-from app.api.services import DatabaseService, FeedbackService, MLService, TranscriptionService
+from app.api.services import (
+    DatabaseService,
+    FeedbackService,
+    TranscriptionService,
+    build_inference_service,
+)
 from app.core.config import Settings, get_settings
 
 logging.basicConfig(
@@ -28,7 +33,7 @@ async def lifespan(app: FastAPI):
     anyio.to_thread.current_default_thread_limiter().total_tokens = settings.thread_pool_size
 
     logger.info("Starting SpeakSure API in %s mode", settings.app_env)
-    app.state.ml_service = MLService(settings)
+    app.state.ml_service = build_inference_service(settings)
     app.state.transcription_service = TranscriptionService(settings)
     app.state.feedback_service = FeedbackService(settings)
     app.state.db_service = DatabaseService(settings)

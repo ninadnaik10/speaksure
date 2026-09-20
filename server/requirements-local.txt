@@ -1,0 +1,7 @@
+# Adds in-process Wav2Vec2 inference, for development or a host with >= 2 GB
+# of RAM. Install on top of requirements.txt and leave INFERENCE_SPACE_URL unset.
+torch==2.8.0
+transformers==4.57.0
+librosa==0.11.0
+numba==0.62.1
+scipy==1.15.3

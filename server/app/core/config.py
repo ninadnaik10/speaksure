@@ -35,6 +35,12 @@ class Settings(BaseSettings):
     transformer_model_name: str = "facebook/wav2vec2-base-960h"
     sample_rate: int = 16000
 
+    # When set, acoustic inference is delegated to a Hugging Face Space and the
+    # server needs no torch/transformers at all. Empty runs the models locally
+    # (requires requirements-local.txt).
+    inference_space_url: str = ""
+    hf_token: str = ""
+
     # Uploads larger than this are rejected before anything is written to disk.
     max_upload_bytes: int = 100 * 1024 * 1024
 
@@ -53,6 +59,14 @@ class Settings(BaseSettings):
     @property
     def scaler_path(self) -> Path:
         return MODELS_DIR / "scaler.pkl"
+
+    @property
+    def mlp_weights_path(self) -> Path:
+        return MODELS_DIR / "mlp.npz"
+
+    @property
+    def uses_remote_inference(self) -> bool:
+        return bool(self.inference_space_url.strip())
 
     @property
     def cors_origin_list(self) -> list[str]:

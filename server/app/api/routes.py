@@ -7,14 +7,19 @@ from typing import Annotated
 from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile, status
 
 from app.core.audio import AudioError, UploadTooLarge, convert_to_wav, save_upload
-from app.api.services import DatabaseService, FeedbackService, MLService, TranscriptionService
+from app.api.services import (
+    DatabaseService,
+    FeedbackService,
+    InferenceService,
+    TranscriptionService,
+)
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
 
-def _ml(request: Request) -> MLService:
+def _ml(request: Request) -> InferenceService:
     return request.app.state.ml_service
 
 

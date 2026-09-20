@@ -1,40 +1,48 @@
 import logging
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 import assemblyai as aai
-import joblib
-import librosa
 import numpy as np
 import soundfile as sf
-import tensorflow as tf
-import torch
 from google import genai
 from pymongo import MongoClient
-from transformers import Wav2Vec2Model, Wav2Vec2Processor
 
 from app.core.config import Settings
+from app.core.mlp import NumpyMLP
 
 logger = logging.getLogger(__name__)
 
 CHUNK_SECONDS = 10
 
 
-class MLService:
-    """Wav2Vec2 feature extraction plus the trained MLP confidence classifier."""
+class InferenceService(Protocol):
+    """Scores an answer's 10-second chunks on the 1-5 confidence scale."""
+
+    def predict(self, audio_path: Path) -> tuple[list[int], float]:
+        ...
+
+
+class LocalMLService:
+    """Wav2Vec2 + the classifier, in-process.
+
+    torch and transformers are imported lazily so this module still imports on
+    a server built for remote inference, where neither is installed.
+    """
 
     def __init__(self, settings: Settings) -> None:
+        import torch
+        from transformers import Wav2Vec2Model, Wav2Vec2Processor
+
         torch.set_num_threads(settings.torch_num_threads)
+        self._torch = torch
         self.sample_rate = settings.sample_rate
 
         logger.info("Loading %s", settings.transformer_model_name)
         self.processor = Wav2Vec2Processor.from_pretrained(settings.transformer_model_name)
         self.wav2vec2 = Wav2Vec2Model.from_pretrained(settings.transformer_model_name)
         self.wav2vec2.eval()
-
-        logger.info("Loading MLP classifier and scaler")
-        self.classifier = tf.keras.models.load_model(str(settings.keras_model_path))
-        self.scaler = joblib.load(settings.scaler_path)
+        self.classifier = NumpyMLP(settings.mlp_weights_path)
 
     def _extract_features(self, audio_chunk: np.ndarray) -> np.ndarray:
         inputs = self.processor(
@@ -43,33 +51,60 @@ class MLService:
             return_tensors="pt",
             padding=True,
         )
-        with torch.no_grad():
+        with self._torch.no_grad():
             outputs = self.wav2vec2(**inputs)
         return outputs.last_hidden_state.mean(dim=1).squeeze().numpy()
 
     def predict(self, audio_path: Path) -> tuple[list[int], float]:
-        """Return a per-10s-chunk confidence sequence (1-5) and its average."""
+        import librosa
+
         audio, sample_rate = librosa.load(str(audio_path), sr=self.sample_rate)
 
         chunk_size = CHUNK_SECONDS * sample_rate
         num_chunks = int(np.ceil(len(audio) / chunk_size))
-        prediction_sequence: list[int] = []
+        predictions: list[int] = []
 
         for index in range(num_chunks):
-            start = index * chunk_size
-            end = min((index + 1) * chunk_size, len(audio))
-            chunk = audio[start:end]
+            chunk = audio[index * chunk_size : (index + 1) * chunk_size]
             if len(chunk) == 0:
                 continue
+            predictions.append(self.classifier.predict_class(self._extract_features(chunk)))
 
-            features = self._extract_features(chunk).reshape(1, -1)
-            predictions = self.classifier.predict(self.scaler.transform(features), verbose=0)
-            prediction_sequence.append(int(np.argmax(predictions) + 1))
-
-        if not prediction_sequence:
+        if not predictions:
             return [], 0.0
-        average = round(sum(prediction_sequence) / len(prediction_sequence), 2)
-        return prediction_sequence, average
+        return predictions, round(sum(predictions) / len(predictions), 2)
+
+
+class RemoteMLService:
+    """Delegates acoustic inference to a Hugging Face Space."""
+
+    def __init__(self, settings: Settings) -> None:
+        from gradio_client import Client, handle_file
+
+        self._handle_file = handle_file
+        logger.info("Using remote inference at %s", settings.inference_space_url)
+        self._client = Client(
+            settings.inference_space_url,
+            hf_token=settings.hf_token or None,
+        )
+
+    def predict(self, audio_path: Path) -> tuple[list[int], float]:
+        result = self._client.predict(
+            self._handle_file(str(audio_path)), api_name="/predict"
+        )
+        if isinstance(result, str):
+            import json
+
+            result = json.loads(result)
+        if "error" in result:
+            raise RuntimeError(f"Inference Space error: {result['error']}")
+        return list(result["prediction"]), float(result["avg_prediction"])
+
+
+def build_inference_service(settings: Settings) -> InferenceService:
+    if settings.uses_remote_inference:
+        return RemoteMLService(settings)
+    return LocalMLService(settings)
 
 
 class TranscriptionService:
